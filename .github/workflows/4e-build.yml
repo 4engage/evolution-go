@@ -1,15 +1,16 @@
 # Build da imagem 4engage do Evolution Go -> GHCR
-# Dispara ao criar uma tag no formato <versao-oficial>-4e.<n> (ex.: 0.7.2-4e.1) ou manualmente.
+# Dispara a cada push nas branches 4e/** (tag da imagem = conteúdo do arquivo 4E_VERSION) ou manualmente.
 name: 4e - build image
 
 on:
   push:
-    tags: ["*-4e.*"]
+    branches: ["4e/**"]
+    paths: ["4E_VERSION"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag da imagem (ex.: 0.7.2-4e.1)"
-        required: true
+        description: "Tag da imagem (vazio = usa 4E_VERSION)"
+        required: false
 
 permissions:
   contents: read
@@ -24,7 +25,8 @@ jobs:
       - name: Definir tag
         id: meta
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="$(tr -d '[:space:]' < 4E_VERSION)"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/evolution-go" >> "$GITHUB_OUTPUT"
 
