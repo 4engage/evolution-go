@@ -301,6 +301,54 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// 4e: pool único do sqlstore do whatsmeow para todo o processo.
+// Antes, cada StartClient chamava sqlstore.New (sql.Open + pool novo) e nunca
+// fechava; reconexões e pedidos de QR acumulavam pools até esgotar o
+// max_connections do Postgres ("pq: sorry, too many clients already").
+var (
+	sharedStoreMu        sync.Mutex
+	sharedStoreContainer *sqlstore.Container
+)
+
+func (w whatsmeowService) sharedStoreContainer() (*sqlstore.Container, error) {
+	sharedStoreMu.Lock()
+	defer sharedStoreMu.Unlock()
+	if sharedStoreContainer != nil {
+		return sharedStoreContainer, nil
+	}
+
+	var dbLog waLog.Logger
+	if w.config.WaDebug != "" {
+		dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+	}
+
+	dialect, dsn := "postgres", w.config.PostgresAuthDB
+	if dsn == "" {
+		dialect = "sqlite"
+		dsn = fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+	}
+
+	db, err := sql.Open(dialect, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	if dialect == "postgres" {
+		db.SetMaxOpenConns(40)
+		db.SetMaxIdleConns(10)
+		db.SetConnMaxIdleTime(5 * time.Minute)
+		db.SetConnMaxLifetime(30 * time.Minute)
+	}
+
+	c := sqlstore.NewWithDB(db, dialect, dbLog)
+	if err := c.Upgrade(context.Background()); err != nil {
+		_ = db.Close()
+		// não guarda o erro: a próxima chamada tenta de novo
+		return nil, fmt.Errorf("failed to upgrade database: %w", err)
+	}
+	sharedStoreContainer = c
+	return c, nil
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
@@ -314,24 +362,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
+	// 4e: um único pool de conexões por processo (antes cada StartClient abria
+	// um pool novo e nunca fechava -> "too many clients" no Postgres).
+	container, err := w.sharedStoreContainer()
 
 	if err != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
