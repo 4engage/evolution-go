@@ -744,6 +744,12 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 	go func() {
 		instanceID := mycli.userID
 		for i, code := range codes {
+			// 4e: rotação de QR de um cliente ANTIGO (substituído por logout/connect) não pode
+			// contar nem derrubar nada: o kill é por instância e mataria a sessão nova e já pareada.
+			if mycli.isStale4e() {
+				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR rotation from a replaced client — stopping without teardown", instanceID)
+				return
+			}
 			// A successful pair (Store.ID set) or an in-flight passkey ceremony
 			// supersedes QR — stop rotating WITHOUT tearing down. Store.ID stays
 			// nil throughout a passkey ceremony (it is only set at PairSuccess),
@@ -851,6 +857,15 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 // If reason is non-empty it is included in the QRTimeout payload (max-count path).
 func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	instanceID := mycli.userID
+
+	// 4e: cliente antigo só encerra a si mesmo; nunca sinaliza o kill da instância.
+	if mycli.isStale4e() {
+		mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] QR teardown from a replaced client — closing only that client", instanceID)
+		if mycli.WAClient != nil && mycli.WAClient.Store.ID == nil {
+			mycli.WAClient.Disconnect()
+		}
+		return
+	}
 
 	if err := mycli.instanceRepository.UpdateQrcode(instanceID, ""); err != nil {
 		mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Error updating instance: %s", instanceID, err)
@@ -2932,4 +2947,17 @@ func cleanSenderID(senderID string) string {
 		}
 	}
 	return senderID
+}
+
+// isStale4e diz se este MyClient já foi substituído por outro cliente da mesma
+// instância, ou se a instância já tem uma sessão pareada em outro cliente.
+func (mycli *MyClient) isStale4e() bool {
+	cur := mycli.clientPointer[mycli.userID]
+	if cur == nil {
+		return false
+	}
+	if cur != mycli.WAClient {
+		return true
+	}
+	return false
 }
