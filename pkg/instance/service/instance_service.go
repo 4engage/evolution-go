@@ -92,6 +92,8 @@ type StatusStruct struct {
 type QrcodeStruct struct {
 	Qrcode string `json:"qrcode"`
 	Code   string `json:"code"`
+	// 4e: true quando a sessão já está logada (não há QR a mostrar).
+	LoggedIn bool `json:"LoggedIn,omitempty"`
 	// Passkey ceremony fields. Populated when the account requires a WebAuthn
 	// passkey to finish linking (no QR to scan at that point). The manager uses
 	// PasskeyStage to switch its UI and PasskeyOpenUrl for the
@@ -415,13 +417,17 @@ func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, erro
 	logger := i.loggerWrapper.GetLogger(instance.Id)
 	client := i.clientPointer[instance.Id]
 
-	// Se não há cliente ou o cliente está logado, precisamos iniciar um novo cliente
-	if client == nil || client.IsLoggedIn() {
-		if client != nil && client.IsLoggedIn() {
-			logger.LogInfo("[%s] Client is logged in, starting new instance for QR code", instance.Id)
-		} else {
-			logger.LogInfo("[%s] No client found, starting new instance for QR code", instance.Id)
-		}
+	// 4e: instância já logada não precisa de QR. Antes abria um SEGUNDO cliente
+	// para a mesma sessão; o loop de QR desse cliente fantasma chegava ao limite
+	// e derrubava a conexão boa. Agora só responde "já logado".
+	if client != nil && client.IsLoggedIn() {
+		logger.LogInfo("[%s] QR requested but session is already logged in — not starting a new client", instance.Id)
+		return &QrcodeStruct{LoggedIn: true}, nil
+	}
+
+	// Se não há cliente, precisamos iniciar um novo cliente
+	if client == nil {
+		logger.LogInfo("[%s] No client found, starting new instance for QR code", instance.Id)
 
 		// Iniciar nova instância para gerar QR code
 		err := i.whatsmeowService.StartInstance(instance.Id)
@@ -437,7 +443,7 @@ func (i instances) GetQr(instance *instance_model.Instance) (*QrcodeStruct, erro
 		// Verificar novamente se há cliente
 		client = i.clientPointer[instance.Id]
 		if client != nil && client.IsLoggedIn() {
-			return nil, fmt.Errorf("session already logged in")
+			return &QrcodeStruct{LoggedIn: true}, nil
 		}
 	} else if !client.IsConnected() {
 		// Se o cliente existe mas não está conectado, pode estar aguardando QR code

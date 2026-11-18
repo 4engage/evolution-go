@@ -5,6 +5,7 @@ import (
 	"context"
 	crypto_rand "crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -233,6 +234,12 @@ type ButtonStruct struct {
 	ImageUrl string `json:"imageUrl,omitempty"`
 	// Optional video URL used as header for reply-only buttons.
 	VideoUrl string `json:"videoUrl,omitempty"`
+	// 4e: envelope da mensagem interativa: "document" (padrão), "none" ou "viewonce".
+	Wrap4e string `json:"wrap4e,omitempty"`
+	// 4e: inclui o nó <bot biz_bot="1"/> em chats 1:1 (padrão: false).
+	BotNode4e *bool `json:"botNode4e,omitempty"`
+	// 4e: true volta ao formato antigo (ButtonsMessage) para botões reply.
+	Legacy4e bool `json:"legacy4e,omitempty"`
 }
 
 // Row is a selectable item inside a list Section.
@@ -1855,8 +1862,9 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 	var msg *waE2E.Message
 	var msgType string
 
-	if hasReply && !hasOtherTypes && !hasPix {
+	if hasReply && !hasOtherTypes && !hasPix && data.Legacy4e {
 		// Reply-only: native ButtonsMessage wrapped in DocumentWithCaptionMessage (Baileys PR #36).
+		// 4e: o WhatsApp passou a recusar este formato com erro 405; só usado com legacy4e=true.
 		var replyButtons []*waE2E.ButtonsMessage_Button
 		for _, v := range data.Buttons {
 			replyButtons = append(replyButtons, &waE2E.ButtonsMessage_Button{
@@ -1971,89 +1979,63 @@ func (s *sendService) SendButton(data *ButtonStruct, instance *instance_model.In
 			return t
 		}()
 
-		msg = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: &waE2E.Message{
-					InteractiveMessage: &waE2E.InteractiveMessage{
-						Body: &waE2E.InteractiveMessage_Body{
-							Text: &body,
-						},
-						Footer: &waE2E.InteractiveMessage_Footer{
-							Text: &data.Footer,
-						},
-						InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
-							NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
-								Buttons:           buttons,
-								MessageParamsJSON: &messageParamsJSON,
-								MessageVersion:    proto.Int32(1),
-							},
-						},
-					},
+		interactive := &waE2E.InteractiveMessage{
+			Body: &waE2E.InteractiveMessage_Body{
+				Text: &body,
+			},
+			Footer: &waE2E.InteractiveMessage_Footer{
+				Text: &data.Footer,
+			},
+			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+					Buttons:           buttons,
+					MessageParamsJSON: &messageParamsJSON,
+					MessageVersion:    proto.Int32(1),
 				},
 			},
-			MessageContextInfo: &waE2E.MessageContextInfo{
-				MessageSecret: btnMsgSecret,
-			},
 		}
+		// 4e: imagem opcional no cabeçalho (antes só existia no formato antigo).
+		if data.ImageUrl != "" {
+			if resp, err := http.Get(data.ImageUrl); err == nil {
+				fileData, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr == nil {
+					if uploaded, upErr := client.Upload(context.Background(), fileData, whatsmeow.MediaImage); upErr == nil {
+						interactive.Header = &waE2E.InteractiveMessage_Header{
+							HasMediaAttachment: proto.Bool(true),
+							Media: &waE2E.InteractiveMessage_Header_ImageMessage{
+								ImageMessage: &waE2E.ImageMessage{
+									URL:           proto.String(uploaded.URL),
+									DirectPath:    proto.String(uploaded.DirectPath),
+									MediaKey:      uploaded.MediaKey,
+									Mimetype:      proto.String("image/jpeg"),
+									FileEncSHA256: uploaded.FileEncSHA256,
+									FileSHA256:    uploaded.FileSHA256,
+									FileLength:    proto.Uint64(uint64(len(fileData))),
+								},
+							},
+						}
+					}
+				}
+			}
+		}
+		msg = wrapInteractive4e(interactive, data.Wrap4e, btnMsgSecret)
 		msgType = "InteractiveMessage"
 	}
 
-	// Build biz/bot nodes injected directly in the XMPP stanza — required for mobile rendering.
-	// Reply-only buttons get <biz><buttons/></biz>; CTA/Pix get <biz><interactive type="native_flow" v="1"><native_flow name="X"/></interactive></biz>.
-	// The <bot biz_bot="1"/> node is required for 1:1 chats (skipped on groups).
-	var bizInteractiveContent waBinary.Node
-	if hasReply && !hasOtherTypes && !hasPix {
-		bizInteractiveContent = waBinary.Node{
-			Tag: "interactive",
-			Attrs: waBinary.Attrs{
-				"type": "native_flow",
-				"v":    "1",
-			},
-			Content: []waBinary.Node{{
-				Tag: "native_flow",
-				Attrs: waBinary.Attrs{
-					"name": "quick_reply",
-				},
-			}},
-		}
-	} else if hasPix {
-		bizInteractiveContent = waBinary.Node{
-			Tag: "interactive",
-			Attrs: waBinary.Attrs{
-				"type": "native_flow",
-				"v":    "1",
-			},
-			Content: []waBinary.Node{{
-				Tag: "native_flow",
-				Attrs: waBinary.Attrs{
-					"name": "payment_info",
-				},
-			}},
-		}
+	// 4e: nó <biz> no formato dos clientes oficiais (whatsmeow PR #1235). O formato
+	// simples (<biz><interactive/></biz>) passou a ser recusado (473/479) ou não entregue.
+	var bizNodes []waBinary.Node
+	if msgType == "ButtonsMessage" {
+		bizNodes = []waBinary.Node{{Tag: "biz", Content: []waBinary.Node{{Tag: "buttons"}}}}
 	} else {
-		// Mixed CTA buttons (url/copy/call) — name="mixed" is the WhatsApp convention.
-		bizInteractiveContent = waBinary.Node{
-			Tag: "interactive",
-			Attrs: waBinary.Attrs{
-				"type": "native_flow",
-				"v":    "1",
-			},
-			Content: []waBinary.Node{{
-				Tag: "native_flow",
-				Attrs: waBinary.Attrs{
-					"name": "mixed",
-				},
-			}},
+		flowName := "mixed"
+		if hasPix {
+			flowName = "payment_info"
 		}
+		bizNodes = []waBinary.Node{bizNode4e(flowName)}
 	}
-
-	bizNodes := []waBinary.Node{
-		{
-			Tag:     "biz",
-			Content: []waBinary.Node{bizInteractiveContent},
-		},
-	}
-	if !strings.Contains(data.Number, "@g.us") {
+	if data.BotNode4e != nil && *data.BotNode4e && !strings.Contains(data.Number, "@g.us") {
 		bizNodes = append(bizNodes, waBinary.Node{
 			Tag:   "bot",
 			Attrs: waBinary.Attrs{"biz_bot": "1"},
@@ -3376,5 +3358,54 @@ func NewSendService(
 		whatsmeowService: whatsmeowService,
 		config:           config,
 		loggerWrapper:    loggerWrapper,
+	}
+}
+
+// bizNode4e monta o nó <biz> que acompanha mensagens native_flow, no formato
+// observado em clientes oficiais (ver tulir/whatsmeow PR #1235).
+func bizNode4e(flowName string) waBinary.Node {
+	decision := make([]byte, 20)
+	_, _ = crypto_rand.Read(decision)
+	return waBinary.Node{
+		Tag: "biz",
+		Attrs: waBinary.Attrs{
+			"actual_actors":   "2",
+			"host_storage":    "2",
+			"privacy_mode_ts": strconv.FormatInt(time.Now().Unix(), 10),
+		},
+		Content: []waBinary.Node{
+			{
+				Tag:   "interactive",
+				Attrs: waBinary.Attrs{"type": "native_flow", "v": "1"},
+				Content: []waBinary.Node{{
+					Tag:   "native_flow",
+					Attrs: waBinary.Attrs{"v": "9", "name": flowName},
+				}},
+			},
+			{
+				Tag:   "quality_control",
+				Attrs: waBinary.Attrs{"decision_id": hex.EncodeToString(decision), "source_type": "third_party"},
+				Content: []waBinary.Node{{
+					Tag:   "decision_source",
+					Attrs: waBinary.Attrs{"value": "df"},
+				}},
+			},
+		},
+	}
+}
+
+// wrapInteractive4e coloca a InteractiveMessage no envelope pedido.
+func wrapInteractive4e(im *waE2E.InteractiveMessage, mode string, secret []byte) *waE2E.Message {
+	ctx := &waE2E.MessageContextInfo{MessageSecret: secret}
+	switch mode {
+	case "none":
+		return &waE2E.Message{InteractiveMessage: im, MessageContextInfo: ctx}
+	case "viewonce":
+		return &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{InteractiveMessage: im, MessageContextInfo: ctx}}}
+	default:
+		return &waE2E.Message{
+			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{InteractiveMessage: im}},
+			MessageContextInfo:         ctx,
+		}
 	}
 }
