@@ -246,14 +246,27 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	// Verifica se a instância já está rodando
 	isInstanceRunning := i.clientPointer[instance.Id] != nil
 
-	// Sincroniza as configurações na instância em execução (se já estiver conectada)
-	err = i.whatsmeowService.UpdateInstanceSettings(instance.Id)
-	if err != nil {
-		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Instance not in runtime yet, will be updated when connected", instance.Id)
+	// 4e: cliente "zumbi" = desconectado e nunca pareado (ex.: QR expirou). Antes ele
+	// contava como "rodando" e o connect não criava cliente novo: nenhum QR novo saía.
+	// Uma sessão pareada que só caiu (Store.ID != nil) segue o fluxo normal de reconexão.
+	zumbi := false
+	if cur := i.clientPointer[instance.Id]; cur != nil && !cur.IsConnected() && cur.Store != nil && cur.Store.ID == nil {
+		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Disconnected unpaired client found — starting a fresh client for a new QR", instance.Id)
+		cur.Disconnect()
+		zumbi = true
 		isInstanceRunning = false
-	} else {
-		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Instance settings updated successfully in runtime", instance.Id)
-		isInstanceRunning = true
+	}
+
+	// Sincroniza as configurações na instância em execução (se já estiver conectada)
+	if !zumbi {
+		err = i.whatsmeowService.UpdateInstanceSettings(instance.Id)
+		if err != nil {
+			i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Instance not in runtime yet, will be updated when connected", instance.Id)
+			isInstanceRunning = false
+		} else {
+			i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Instance settings updated successfully in runtime", instance.Id)
+			isInstanceRunning = true
+		}
 	}
 
 	// Se a instância não estiver rodando, inicia uma nova
