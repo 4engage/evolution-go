@@ -273,6 +273,12 @@ func (i instances) Connect(data *ConnectStruct, instance *instance_model.Instanc
 	if !isInstanceRunning {
 		i.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Starting new client instance", instance.Id)
 
+		// 4e: apaga o QR guardado de uma tentativa anterior. Sem isso, quem consulta
+		// /instance/qr logo depois do connect recebe o código de um cliente que já morreu.
+		if err := i.instanceRepository.UpdateQrcode(instance.Id, ""); err != nil {
+			i.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] Could not clear stale QR code: %v", instance.Id, err)
+		}
+
 		i.killChannel[instance.Id] = make(chan bool)
 
 		clientData := &whatsmeow_service.ClientData{
